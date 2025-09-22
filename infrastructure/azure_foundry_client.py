@@ -1,160 +1,81 @@
-# azure_openai_client.py
-# -----------------------------------------------------------------------------
-# Azure AI Foundry client that standardizes on the single Models inference
-# endpoint. Applications keep one base URL and one key and route requests by
-# supplying a deployment name in the "model" field.
-#
-# Highlights
-# ----------
-# - Uses a single async `invoke` method (from IFoundryClient) to call any
-#   `/models/<route>` endpoint (chat/completions, embeddings, images/embeddings).
-# - Provides convenience helpers for common tasks (chat, streaming chat,
-#   text embeddings, image embeddings) without hiding the generic route.
-# - Reads endpoint and key from Azure Key Vault via DefaultAzureCredential.
-# - Supports provider-specific parameters via `extra-parameters: pass-through`.
-#
-# Switching auth
-# --------------
-# - This implementation uses key-based auth (`api-key` header). If the project
-#   adopts Microsoft Entra ID, replace the header with a Bearer token and remove
-#   `api-key` construction in `_build_headers`.
-# -----------------------------------------------------------------------------
-
-import os
+# infrastructure/azure_foundry_client.py
 import json
 from typing import Any, AsyncIterator, Dict, Optional, Union, List
 
-# Retained because other parts of the repository may rely on this import.
-# This client uses httpx for HTTP calls; drop aiohttp if not required elsewhere.
-import aiohttp  # intentionally retained
 import httpx
+from azure.identity.aio import DefaultAzureCredential
+from azure.keyvault.secrets.aio import SecretClient
 
 from domain.contracts.i_foundry_client import IFoundryClient
 from common.config import settings
-
-from azure.identity.aio import DefaultAzureCredential
-from azure.keyvault.secrets.aio import SecretClient
 
 
 class AzureFoundryClient(IFoundryClient):
     """
     Azure AI Foundry client using the Models inference endpoint.
-
-    Operational model
-    -----------------
-    - Base URL:  https://<resource>.services.ai.azure.com/models
-    - Routing:   The request body includes `model: "<deployment-name>"`,
-                 which directs Foundry to the correct deployment.
-    - API shape: Consistent with the Foundry Model Inference API, enabling
-                 chat completions, text embeddings, image embeddings, and
-                 future routes without SDK churn.
-
-    Public surface
-    --------------
-    - `invoke()`               : generic dispatcher for any /models route
-    - `chat()`                 : backward-compatible single-prompt helper
-    - `chat_messages()`       : multi-turn chat (non-streaming)
-    - `chat_stream()`         : streaming chat via SSE
-    - `embeddings()`          : text embeddings
-    - `image_embeddings()`    : image embeddings (base64 PNG)
+    Assumes the Key Vault secret for inference URL already includes `/models`.
     """
 
     def __init__(self):
-        # Key Vault secret names (configured in application settings).
-        self.key_vault_url = f"https://{settings.azure_key_vault_name}.vault.azure.net/"
-        self.azure_foundry_endpoint = settings.azure_foundry_endpoint  # KV secret name for endpoint
-        self.azure_foundry_key = settings.azure_foundry_key            # KV secret name for API key
+        self._kv_url = f"https://{settings.azure_key_vault_name}.vault.azure.net/"
+        self._endpoint_secret_name = settings.azure_foundry_endpoint
+        self._inference_secret_name = settings.azure_foundry_inference_url
+        self._key_secret_name = settings.azure_foundry_key
 
-        # Optional defaults for convenience. Calls can override these per request.
-        self.default_model_deployment = getattr(settings, "azure_foundry_deployment", None)
-        self.api_version = getattr(settings, "azure_foundry_api_version", "2024-05-01-preview")
+        self._default_model = getattr(settings, "azure_foundry_deployment", None)
+        self._embed_model= getattr(settings, "azure_foundry_deployment_embed", None)
+        self._api_version = getattr(settings, "azure_foundry_api_version", "2024-05-01-preview")
 
-        # Resolved values after Key Vault lookup.
-        self.azure_foundry_endpoint_value: Optional[str] = None
-        self.azure_foundry_key_value: Optional[str] = None
-
-        # Cached default headers (without provider pass-through).
-        self.headers: Optional[Dict[str, str]] = None
-
-    # -------------------------------------------------------------------------
-    # Initialization
-    # -------------------------------------------------------------------------
+        self._inference_base: Optional[str] = None
+        self._api_key: Optional[str] = None
+        self._client: Optional[httpx.AsyncClient] = None
 
     async def initialize(self):
-        """
-        Resolve the Foundry Models endpoint and key from Azure Key Vault.
-
-        Uses DefaultAzureCredential, which supports managed identity, CLI login,
-        environment credentials, and other standard Azure auth flows.
-        """
+        """Fetch secrets from Key Vault and prepare HTTP client."""
         try:
-            async with DefaultAzureCredential() as credential:
-                async with SecretClient(vault_url=self.key_vault_url, credential=credential) as client:
-                    endpoint_secret = await client.get_secret(self.azure_foundry_endpoint)
-                    key_secret = await client.get_secret(self.azure_foundry_key)
+            async with DefaultAzureCredential() as cred:
+                async with SecretClient(vault_url=self._kv_url, credential=cred) as kv:
+                    inference_url = await kv.get_secret(self._inference_secret_name)
+                    api_key = await kv.get_secret(self._key_secret_name)
 
-                    self.azure_foundry_endpoint_value = (endpoint_secret.value or "").rstrip("/")
-                    self.azure_foundry_key_value = key_secret.value or ""
+            self._inference_base = (inference_url.value or "").rstrip("/")
+            self._api_key = api_key.value or ""
 
-            # Build default headers once secrets are available.
-            self.headers = self._build_headers(extra_params_mode="reject")
+            if self._client is None:
+                self._client = httpx.AsyncClient(timeout=60.0)
 
         except Exception as e:
-            # Surface a clear startup failure to callers.
-            raise RuntimeError(f"Failed to initialize AzureOpenAIClient: {e}") from e
+            raise RuntimeError(f"Failed to initialize AzureFoundryClient: {e}") from e
 
     async def _ensure_ready(self):
-        """
-        Ensure the client has resolved secrets and prepared headers.
-
-        This lazy guard allows either:
-        - explicit initialization at app start, or
-        - on-demand initialization at first call.
-        """
-        if not self.azure_foundry_endpoint_value or not self.azure_foundry_key_value:
+        if not (self._inference_base and self._api_key):
             await self.initialize()
-        if self.headers is None:
-            self.headers = self._build_headers(extra_params_mode="reject")
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=60.0)
 
-    # -------------------------------------------------------------------------
-    # Internal helpers
-    # -------------------------------------------------------------------------
+    def _url(self, route: str, api_version: Optional[str] = None) -> str:
+        """Compose full URL: <inference-base>/<route>?api-version=<ver>."""
+        ver = api_version or self._api_version
+        return f"{self._inference_base}/{route.lstrip('/')}?api-version={ver}"
 
-    # --- headers: allow content_type & accept to be customized or omitted ---
-
-    # --- headers: allow content_type & accept to be customized or omitted ---
-
-    def _build_headers(
+    def _headers(
         self,
         *,
-        content_type: Optional[str] = "application/json",  # None => omit header
-        accept: Optional[str] = None,                      # e.g., "text/event-stream" for SSE
-        extra_params_mode: str = "reject",                 # "reject" | "pass-through"
-        extra: Optional[Dict[str, str]] = None
+        content_type: Optional[str] = "application/json",
+        accept: Optional[str] = None,
+        extra_params_mode: str = "reject",
+        extra: Optional[Dict[str, str]] = None,
     ) -> Dict[str, str]:
-        """
-        Build HTTP headers for Foundry Models.
-
-        - Key-based authentication uses `api-key`.
-        - `content_type=None` omits Content-Type so multipart boundaries can be set by httpx.
-        - `accept` allows explicit Accept negotiation (e.g., SSE).
-        - `extra-parameters: pass-through` forwards unknown JSON fields to the provider.
-        """
-        h = {
-            "api-key": self.azure_foundry_key_value or "",
-        }
+        headers = {"api-key": self._api_key}
         if content_type:
-            h["Content-Type"] = content_type
+            headers["Content-Type"] = content_type
         if accept:
-            h["Accept"] = accept
+            headers["Accept"] = accept
         if extra_params_mode == "pass-through":
-            h["extra-parameters"] = "pass-through"
+            headers["extra-parameters"] = "pass-through"
         if extra:
-            h.update(extra)
-        return h
-
-
-    # --- invoke: support json, multipart/form-data, and raw binary ---
+            headers.update(extra)
+        return headers
 
     async def invoke(
         self,
@@ -167,99 +88,131 @@ class AzureFoundryClient(IFoundryClient):
         headers: Optional[Dict[str, str]] = None,
         api_version: Optional[str] = None,
         timeout: Optional[float] = 60.0,
-
-        # New flexibility knobs:
-        content_type: Optional[str] = "application/json",        # None => omit, good for multipart
-        accept: Optional[str] = None,                            # e.g., "text/event-stream" for SSE
-        files: Optional[Dict[str, Any]] = None,                  # for multipart/form-data
-        data: Optional[Dict[str, Any]] = None,                   # for multipart or form fields
-        raw: Optional[Union[bytes, bytearray, memoryview]] = None,  # for application/octet-stream
+        content_type: Optional[str] = "application/json",
+        accept: Optional[str] = None,
+        files: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
+        raw: Optional[Union[bytes, bytearray, memoryview]] = None,
     ) -> Union[Dict[str, Any], AsyncIterator[Dict[str, Any]]]:
         """
-        Execute a generic call to any Foundry Models route, supporting:
-        - JSON (`json=...`),
-        - multipart/form-data (`files=...`, `data=...`),
-        - raw binary (`content=...` with `content_type="application/octet-stream"`).
+        Generic dispatcher for Foundry Models. Supports JSON, multipart/form-data,
+        and raw binary; SSE streaming for chat-completions routes.
 
         Notes
         -----
-        - Vision (chat) & image embeddings typically remain JSON with base64/URLs.
-        - For streaming, Accept may be set to "text/event-stream".
+        - For chat streaming, the API requires BOTH:
+            1) Accept: text/event-stream
+            2) { "stream": true } in the JSON body
+        - Routes that require a deployment name: chat/completions, embeddings, images/embeddings.
         """
         await self._ensure_ready()
 
-        # Inject deployment name if not present and relevant
-        deployment = model or self.default_model_deployment
-        if deployment and "model" not in body and not files and raw is None:
-            # In multipart/raw scenarios, the model routing may be carried in form fields or URL;
-            # leave it to the caller to include the right field in those cases.
-            body = {**body, "model": deployment}
+        # Routes that require a model (deployment name)
+        requires_model = route.lstrip("/") in {
+            "chat/completions",
+            "embeddings",
+            "images/embeddings",
+        }
 
-        # Auto Accept for streaming if caller didn't set one
+        # Inject deployment if not provided (for JSON path only)
+        if "model" not in body and not files and raw is None:
+            body = {**body, "model": model or self._default_model}
+
+        # Fail fast if still missing for routes that need a model
+        if requires_model and "model" not in body:
+            raise ValueError(
+                "Missing 'model' (deployment name). "
+                "Pass model=... or set settings.azure_foundry_deployment."
+            )
+
+        # Streaming: set Accept header and 'stream': true in JSON payload
         effective_accept = accept or ("text/event-stream" if stream else None)
+        effective_ct = None if (files or data) else content_type
 
-        # Omit Content-Type when sending multipart (`files` or `data`) so httpx sets boundaries.
-        effective_content_type = None if (files or data) else content_type
-
-        url = self._url(route, api_version=api_version)
-        hdrs = self._build_headers(
-            content_type=effective_content_type,
+        url = self._url(route, api_version)
+        hdrs = self._headers(
+            content_type=effective_ct,
             accept=effective_accept,
             extra_params_mode=extra_params_mode,
             extra=headers,
         )
 
-        # Build request kwargs based on the chosen body shape
-        request_kwargs: Dict[str, Any] = {"headers": hdrs}
-        if files or data:
-            # multipart/form-data or form-encoded; do not pass json=
-            if data:
-                request_kwargs["data"] = data
-            if files:
-                request_kwargs["files"] = files
-        elif raw is not None:
-            # raw binary payload
-            request_kwargs["content"] = raw
-        else:
-            # default JSON
-            request_kwargs["json"] = body
+        if stream and not files and raw is None:
+            body = {**body, "stream": True}
 
+        # Build the request kwargs based on body shape
+        req_kwargs: Dict[str, Any] = {"headers": hdrs}
+        if files or data:
+            if data:
+                req_kwargs["data"] = data
+            if files:
+                req_kwargs["files"] = files
+        elif raw is not None:
+            req_kwargs["content"] = raw
+        else:
+            req_kwargs["json"] = body
+
+        # ---- Streaming path (SSE) ----
         if stream:
-            # Stream SSE; httpx will set the appropriate response handling.
-            client = httpx.AsyncClient(timeout=None)
-            resp_cm = client.stream("POST", url, **request_kwargs)
+            assert self._client is not None
+            # For streams, avoid a hard timeout unless you want to enforce one
+            resp_cm = self._client.stream("POST", url, timeout=None, **req_kwargs)
 
             async def _aiter() -> AsyncIterator[Dict[str, Any]]:
-                async with client:
-                    async with resp_cm as r:
-                        r.raise_for_status()
-                        async for line in r.aiter_lines():
-                            if not line or not line.startswith("data:"):
-                                continue
-                            if line.strip() == "data: [DONE]":
-                                break
-                            yield json.loads(line.removeprefix("data: ").strip())
+                async with resp_cm as r:
+                    r.raise_for_status()
+                    ctype = (r.headers.get("Content-Type") or "").lower()
+                    # Fallback: if not SSE, try to parse full JSON once and yield
+                    if "text/event-stream" not in ctype:
+                        full = await r.aread()
+                        try:
+                            yield json.loads(full)
+                        except Exception:
+                            # If the server returned non-JSON with 200 OK, nothing to stream
+                            return
+                        return
+
+                    async for line in r.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        if line.strip() == "data: [DONE]":
+                            break
+                        yield json.loads(line.removeprefix("data: ").strip())
+
             return _aiter()
 
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(url, **request_kwargs)
-            resp.raise_for_status()
-            return resp.json()
+        # ---- Non-streaming path ----
+        assert self._client is not None
+        resp = await self._client.post(url, timeout=timeout, **req_kwargs)
+        resp.raise_for_status()
+        return resp.json()
 
-    # -------------------------------------------------------------------------
-    # Convenience wrappers
-    # -------------------------------------------------------------------------
+    # ---------------- Convenience wrappers ----------------
 
-    async def chat(self, prompt: str) -> str:
-        """
-        Backward-compatible single-turn chat helper.
 
-        Underlying call:
-          - POST /models/chat/completions with `messages=[{"role":"user","content":...}]`
-        """
-        messages = [{"role": "user", "content": prompt}]
-        data = await self.invoke("chat/completions", body={"messages": messages})
+    async def chat(
+        self,
+        prompt: str,
+        *,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        extra_params_mode: str = "reject",
+    ) -> str:
+        body: Dict[str, Any] = {"messages": [{"role": "user", "content": prompt}]}
+        if temperature is not None:
+            body["temperature"] = temperature
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
+
+        data = await self.invoke(
+            "chat/completions",
+            body=body,
+            model=model,
+            extra_params_mode=extra_params_mode,
+        )
         return data["choices"][0]["message"]["content"]
+
 
     async def chat_messages(
         self,
@@ -270,16 +223,6 @@ class AzureFoundryClient(IFoundryClient):
         max_tokens: Optional[int] = None,
         extra_params_mode: str = "reject",
     ) -> str:
-        """
-        Multi-turn chat helper (non-streaming) returning the assistant's text.
-
-        Notes
-        -----
-        - Multimodal turns are supported by supplying `content` as a list of parts
-          (e.g., text and image_url entries), provided the deployment supports vision.
-        - Provider-specific parameters (e.g., `logprobs`, `top_k`) can be forwarded
-          by enabling `extra_params_mode="pass-through"`.
-        """
         body: Dict[str, Any] = {"messages": messages}
         if temperature is not None:
             body["temperature"] = temperature
@@ -294,87 +237,82 @@ class AzureFoundryClient(IFoundryClient):
         )
         return data["choices"][0]["message"]["content"]
 
+
     async def chat_stream(
         self,
         messages: List[Dict[str, Any]],
         *,
         model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
         extra_params_mode: str = "reject",
     ) -> AsyncIterator[str]:
-        """
-        Streaming chat helper yielding assistant text deltas.
+        # Build body including tunables
+        body: Dict[str, Any] = {"messages": messages}
+        if temperature is not None:
+            body["temperature"] = temperature
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
 
-        Implementation details
-        ----------------------
-        - Sets `stream=true` on the request.
-        - Parses SSE "data:" lines and yields the `choices[0].delta.content` text parts.
-        """
+        # Call with streaming enabled (invoke adds "stream": true + SSE Accept)
         stream_iter = await self.invoke(
             "chat/completions",
-            body={"messages": messages},
+            body=body,
             model=model,
             stream=True,
             extra_params_mode=extra_params_mode,
         )
 
         async for chunk in stream_iter:  # type: ignore
-            delta = chunk["choices"][0].get("delta", {}).get("content")
-            if delta:
-                yield delta
+            # Basic shape guard
+            if not isinstance(chunk, dict):
+                continue
 
-    async def embeddings(
-        self,
-        inputs: Union[str, List[str]],
-        *,
-        model: Optional[str] = None,
-        extra_params_mode: str = "reject",
-    ) -> Dict[str, Any]:
-        """
-        Text embeddings helper.
+            # Some error payloads come back in-stream
+            if "error" in chunk:
+                # surface the provider message, if present
+                err = chunk.get("error")
+                raise RuntimeError(f"Streaming error: {err}")
 
-        Contract
-        --------
-        - POST /models/embeddings with `input` as a string or list of strings.
-        - The response carries embeddings under `data[i].embedding` and usage info.
-        """
-        return await self.invoke(
-            "embeddings",
-            body={"input": inputs},
-            model=model,
-            extra_params_mode=extra_params_mode,
-        )
+            choices = chunk.get("choices") or []
+            if not choices:
+                # Could be a usage/final or heartbeat-like event; skip quietly
+                continue
 
-    async def image_embeddings(
-        self,
-        image_base64_png: str,
-        *,
-        model: Optional[str] = None,
-        extra_params_mode: str = "reject",
-    ) -> Dict[str, Any]:
-        """
-        Image embeddings helper for base64-encoded PNG data.
+            choice0 = choices[0] or {}
 
-        Request shape
-        -------------
-        {
-          "input": [
-            { "type": "image", "image_format": "png", "data": "<base64-bytes>" }
-          ],
-          "model": "<deployment-name>"
-        }
-        """
-        body = {
-            "input": [
-                {
-                    "type": "image",
-                    "image_format": "png",
-                    "data": image_base64_png,
-                }
-            ]
-        }
-        return await self.invoke(
-            "images/embeddings",
-            body=body,
-            model=model,
-            extra_params_mode=extra_params_mode,
-        )
+            # 1) Streaming deltas (most common)
+            delta_obj = choice0.get("delta") or {}
+            if isinstance(delta_obj, dict):
+                # a) Simple string content
+                content = delta_obj.get("content")
+                if isinstance(content, str) and content:
+                    yield content
+                    continue
+
+                # b) Multimodal content (list of parts). Yield only text parts if present.
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            t = part.get("text")
+                            if t:
+                                yield t
+                    continue
+
+                # c) Role-only deltas, tool_calls, etc. -> nothing to emit; continue
+
+            # 2) Some providers send a final non-delta message
+            message_obj = choice0.get("message") or {}
+            final_content = message_obj.get("content")
+            if isinstance(final_content, str) and final_content:
+                yield final_content
+                continue
+
+
+    async def embeddings(self, inputs: Union[str, List[str]], **kwargs) -> Dict[str, Any]:
+        return await self.invoke("embeddings", {"input": inputs}, **kwargs)
+
+    async def image_embeddings(self, image_base64_png: str, **kwargs) -> Dict[str, Any]:
+        return await self.invoke("images/embeddings", {
+            "input": [{"type": "image", "image_format": "png", "data": image_base64_png}]
+        }, **kwargs)
