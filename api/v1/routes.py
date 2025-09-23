@@ -2,9 +2,16 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+
 
 from application.services.customer_management_service import CustomerEngagementService
+from application.services.document_processing_service import DocumentProcessingService
+
+from application.dto.document_extract_request_dto import DocumentExtractRequestDTO
+from application.dto.document_extract_response_dto import DocumentExtractResponseDTO
+from application.dto.chat_request_dto import ChatRequestDTO
+from application.dto.chat_response_dto import ChatResponseDTO
+
 from infrastructure.azure_foundry_client import AzureFoundryClient
 
 router = APIRouter()
@@ -34,6 +41,14 @@ def get_customer_engagement_service(
     Provides the service layer with the Foundry client dependency injected.
     """
     return CustomerEngagementService(foundry_client=foundry_client)
+
+def get_document_processing_service(
+    foundry_client: AzureFoundryClient = Depends(get_foundry_client),
+) -> DocumentProcessingService:
+    """
+    Provides the service layer with the Foundry client dependency injected.
+    """
+    return DocumentProcessingService(foundry_client=foundry_client)
 
 
 # -------------------------------
@@ -71,24 +86,9 @@ async def chat_endpoint(
         raise HTTPException(status_code=502, detail=f"Chat failed: {e}") from e
 
 
-# -------------------------------
-# Chat: POST (JSON) - recommended
-# -------------------------------
-class ChatRequest(BaseModel):
-    prompt: str
-    model: Optional[str] = None
-    system_prompt: Optional[str] = None
-    temperature: Optional[float] = 0.2
-    max_tokens: Optional[int] = 512
-
-
-class ChatResponse(BaseModel):
-    message: str
-
-
-@router.post("/chat", response_model=ChatResponse)
+@router.post("/chat", response_model=ChatResponseDTO)
 async def chat_post_endpoint(
-    payload: ChatRequest,
+    payload: ChatRequestDTO,
     service: CustomerEngagementService = Depends(get_customer_engagement_service),
 ):
     """
@@ -104,6 +104,33 @@ async def chat_post_endpoint(
             temperature=payload.temperature or 0.2,
             max_tokens=payload.max_tokens or 512,
         )
-        return ChatResponse(message=text)
+        return ChatResponseDTO(message=text)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Chat failed: {e}") from e
+
+
+@router.post("/document/extract", response_model=DocumentExtractResponseDTO)
+async def extract_document_post_endpoint(payload: DocumentExtractRequestDTO,
+    service: DocumentProcessingService = Depends(get_document_processing_service)):
+    results = await service.extract_strucutured_data(
+        document_base64=payload.document_base64,
+        model=payload.model,
+        document_type=payload.document_type
+    )
+
+    return DocumentExtractResponseDTO(
+        extracted_data=results
+    )
+
+    @route.post("/document/classify", response_model=DocumentExtractResponseDTO)
+    async def classify_document_post_endpoint(payload: DocumentExtractRequestDTO,
+        service: DocumentProcessingService = Depends(get_document_processing_service)):
+        results = await service.extract_strucutured_data(
+            document_base64=payload.document_base64,
+            model=payload.model,
+            document_type=payload.document_type
+        )
+
+        return DocumentExtractResponseDTO(
+            extracted_data=results
+        )
