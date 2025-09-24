@@ -6,11 +6,15 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from application.services.customer_management_service import CustomerEngagementService
 from application.services.document_processing_service import DocumentProcessingService
+from application.services.personalisation_service import PersonalizationService
 
 from application.dto.document_extract_request_dto import DocumentExtractRequestDTO
 from application.dto.document_extract_response_dto import DocumentExtractResponseDTO
 from application.dto.chat_request_dto import ChatRequestDTO
 from application.dto.chat_response_dto import ChatResponseDTO
+from application.dto.recommendation_request_dto import RecommendationRequestDTO
+from application.dto.recommendation_response_dto import RecommendationResponseDTO
+
 
 from infrastructure.azure_foundry_client import AzureFoundryClient
 
@@ -50,6 +54,10 @@ def get_document_processing_service(
     """
     return DocumentProcessingService(foundry_client=foundry_client)
 
+def get_personalisation_service(
+    foundry_client: AzureFoundryClient = Depends(get_foundry_client)
+) -> PersonalizationService:
+    return PersonalizationService(foundry_client=foundry_client)
 
 # -------------------------------
 # Health
@@ -134,3 +142,17 @@ async def extract_document_post_endpoint(payload: DocumentExtractRequestDTO,
         return DocumentExtractResponseDTO(
             extracted_data=results
         )
+
+
+@router.post("/personalize/recommend", response_model=RecommendationResponseDTO)
+async def recommend_endpoint(
+    payload: RecommendationRequestDTO,
+    service: PersonalizationService = Depends(get_personalisation_service)
+):
+    result = await service.get_recommendations(
+        user_id=payload.user_id,
+        context=payload.context,
+        model=payload.model,
+        num_results=payload.num_results
+    )
+    return RecommendationResponseDTO(recommendations=result)

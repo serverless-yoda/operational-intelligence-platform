@@ -32,7 +32,7 @@ class DocumentProcessingService:
         if additional_params:
             payload.update(additional_params)
 
-        response = await self.foundry_client.invoke(route="images/embeddings"),body=payload,model=model)
+        response = await self.foundry_client.invoke(route="images/embeddings",body=payload,model=model)
 
         return response
 
