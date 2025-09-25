@@ -3,5 +3,5 @@
 from typing import  Dict, List, Any
 from pydantic import BaseModel
 
-class RecommendationResponsetDTO(BaseModel):
+class RecommendationResponseDTO(BaseModel):
      recommendations: List[Dict[str, Any]]
