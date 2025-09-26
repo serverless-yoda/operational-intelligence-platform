@@ -8,6 +8,7 @@ from application.services.customer_management_service import CustomerEngagementS
 from application.services.document_processing_service import DocumentProcessingService
 from application.services.personalisation_service import PersonalizationService
 from application.services.operational_intelligence_service import OperationalIntelligenceService
+from application.services.document_processing_service import DocumentProcessingService
 
 from application.dto.document_extract_request_dto import DocumentExtractRequestDTO
 from application.dto.document_extract_response_dto import DocumentExtractResponseDTO
@@ -16,6 +17,12 @@ from application.dto.chat_response_dto import ChatResponseDTO
 from application.dto.recommendation_request_dto import RecommendationRequestDTO
 from application.dto.recommendation_response_dto import RecommendationResponseDTO
 from application.dto.anomaly_request_dto import AnomalyRequestDTO
+from application.dto.document_extract_request_dto import DocumentExtractRequestDTO
+from application.dto.document_extract_response_dto import DocumentExtractResponseDTO
+from application.dto.search_document_request_dto import SearchDocumentsRequestDTO
+from application.dto.search_document_response_dto import SearchDocumentsResponseDTO
+from application.dto.index_documents_request_dto import IndexDocumentsRequestDTO
+from application.dto.index_documents_response_dto import IndexDocumentResponseDTO
 
 
 from infrastructure.azure_foundry_client import AzureFoundryClient
@@ -65,6 +72,12 @@ def get_operational_intelligence_service(
     foundry_client: AzureFoundryClient = Depends(get_foundry_client)
 )-> OperationalIntelligenceService
     return OperationalIntelligenceService(foundry_client=foundry_client)
+
+
+async def get_data_indexing_service(
+    foundry_client: AzureFoundryClient = Depends(get_foundry_client)
+) -> DocumentProcessingService
+    return DocumentProcessingService(foundry_client=foundry_client)
 # -------------------------------
 # Health
 # -------------------------------
@@ -175,3 +188,30 @@ async def anomaly_endpoint(
         model=payload.model,
     )
     return result
+
+
+@router.post("/index/documents", response_model=IndexDocumentResponseDTO)
+async def index_documents_endpoint(
+    payload: IndexDocumentsRequestDTO,
+    service: DocumentProcessingService = Depends(get_data_indexing_service),
+):
+    result = await service.index_documents(
+        documents=[d.dict() for d in payload.documents],
+        index_name=payload.index_name,
+        model=payload.model
+    )
+    return IndexDocumentResponseDTO(indexed=result.get("indexed", 0), failed=result.get("failed", 0))
+
+@router.post("/index/search", response_model=SearchDocumentsResponse)
+async def search_documents_endpoint(
+    payload: SearchDocumentsRequestDTO,
+    service: DocumentProcessingService = Depends(get_data_indexing_service),
+):
+    results = await service.search_documents(
+        query=payload.query,
+        index_name=payload.index_name,
+        model=payload.model,
+        top_k=payload.top_k or 10,
+        filters=payload.filters
+    )
+    return SearchDocumentsResponse(results=results)
